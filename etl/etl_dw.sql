@@ -1,6 +1,6 @@
 PRAGMA foreign_keys = ON;
 
--- dim_tempo
+-- dim_tempo (gera o calendario completo e ignora se ja existir)
 WITH RECURSIVE datas(dt) AS (
     SELECT '2016-09-01'
     UNION ALL
@@ -77,27 +77,31 @@ SELECT
 FROM datas d
 LEFT JOIN feriados f ON d.dt = f.dt;
 
--- dim_pagamento
+-- dim_pagamento (filtra pelos pedidos do lote atual: inicial ou incremental)
 INSERT OR IGNORE INTO dw_dim_pagamento (nk_tipo_pagamento, descricao_pagamento)
 SELECT DISTINCT
-    TRIM(payment_type),
-    CASE TRIM(payment_type)
+    TRIM(op.payment_type),
+    CASE TRIM(op.payment_type)
         WHEN 'credit_card' THEN 'Cartao de Credito'
         WHEN 'boleto' THEN 'Boleto Bancario'
         WHEN 'voucher' THEN 'Voucher'
         WHEN 'debit_card' THEN 'Cartao de Debito'
         WHEN 'not_defined' THEN 'Nao Definido'
-        ELSE TRIM(payment_type)
+        ELSE TRIM(op.payment_type)
     END
-FROM stg_order_payments
-WHERE payment_type IS NOT NULL AND TRIM(payment_type) != '';
+FROM stg_order_payments op
+JOIN stg_orders o ON op.order_id = o.order_id
+WHERE op.payment_type IS NOT NULL
+  AND TRIM(op.payment_type) != ''
+  AND o.order_purchase_timestamp BETWEEN (SELECT data_inicio FROM _etl_parametros)
+                                     AND (SELECT data_fim FROM _etl_parametros);
 
--- dim_produto
+-- dim_produto (carrega apenas os produtos vendidos na janela do lote)
 INSERT OR IGNORE INTO dw_dim_produto (
     nk_product_id, categoria_pt, categoria_en,
     peso_g, comprimento_cm, altura_cm, largura_cm, qtd_fotos
 )
-SELECT
+SELECT DISTINCT
     p.product_id,
     COALESCE(NULLIF(TRIM(p.product_category_name), ''), 'sem_categoria'),
     COALESCE(
@@ -111,10 +115,14 @@ SELECT
     p.product_width_cm,
     CAST(p.product_photos_qty AS INTEGER)
 FROM stg_products p
+JOIN stg_order_items i ON p.product_id = i.product_id
+JOIN stg_orders o ON i.order_id = o.order_id
 LEFT JOIN stg_category_translation t
-    ON TRIM(p.product_category_name) = TRIM(t.product_category_name);
+    ON TRIM(p.product_category_name) = TRIM(t.product_category_name)
+WHERE o.order_purchase_timestamp BETWEEN (SELECT data_inicio FROM _etl_parametros)
+                                     AND (SELECT data_fim FROM _etl_parametros);
 
--- dim_cliente (mantem o endereco do pedido mais recente por customer_unique_id)
+-- dim_cliente (padroniza cidade sem acento/maiuscula e atualiza endereco se o cliente comprar de novo em 2018)
 WITH geo AS (
     SELECT
         printf('%05d', CAST(geolocation_zip_code_prefix AS INTEGER)) AS cep,
@@ -128,16 +136,18 @@ clientes AS (
     SELECT
         c.customer_unique_id,
         printf('%05d', CAST(c.customer_zip_code_prefix AS INTEGER)) AS cep,
-        TRIM(c.customer_city) AS cidade,
+        NORMALIZAR_CIDADE(c.customer_city) AS cidade,
         UPPER(TRIM(c.customer_state)) AS uf,
         ROW_NUMBER() OVER (
             PARTITION BY c.customer_unique_id
             ORDER BY o.order_purchase_timestamp DESC, c.customer_id DESC
         ) AS rn
     FROM stg_customers c
-    LEFT JOIN stg_orders o ON c.customer_id = o.customer_id
+    JOIN stg_orders o ON c.customer_id = o.customer_id
+    WHERE o.order_purchase_timestamp BETWEEN (SELECT data_inicio FROM _etl_parametros)
+                                         AND (SELECT data_fim FROM _etl_parametros)
 )
-INSERT OR IGNORE INTO dw_dim_cliente (
+INSERT INTO dw_dim_cliente (
     nk_customer_unique_id, cep_prefixo, cidade, uf, regiao, latitude, longitude
 )
 SELECT
@@ -157,9 +167,16 @@ SELECT
     g.lng
 FROM clientes c
 LEFT JOIN geo g ON c.cep = g.cep
-WHERE c.rn = 1;
+WHERE c.rn = 1
+ON CONFLICT(nk_customer_unique_id) DO UPDATE SET
+    cep_prefixo = excluded.cep_prefixo,
+    cidade = excluded.cidade,
+    uf = excluded.uf,
+    regiao = excluded.regiao,
+    latitude = excluded.latitude,
+    longitude = excluded.longitude;
 
--- dim_vendedor
+-- dim_vendedor (padroniza nome da cidade e filtra vendedores que atuaram no lote)
 WITH geo AS (
     SELECT
         printf('%05d', CAST(geolocation_zip_code_prefix AS INTEGER)) AS cep,
@@ -172,10 +189,10 @@ WITH geo AS (
 INSERT OR IGNORE INTO dw_dim_vendedor (
     nk_seller_id, cep_prefixo, cidade, uf, regiao, latitude, longitude
 )
-SELECT
+SELECT DISTINCT
     s.seller_id,
     printf('%05d', CAST(s.seller_zip_code_prefix AS INTEGER)),
-    TRIM(s.seller_city),
+    NORMALIZAR_CIDADE(s.seller_city),
     UPPER(TRIM(s.seller_state)),
     CASE
         WHEN UPPER(TRIM(s.seller_state)) IN ('AC', 'AP', 'AM', 'PA', 'RO', 'RR', 'TO') THEN 'Norte'
@@ -188,10 +205,14 @@ SELECT
     g.lat,
     g.lng
 FROM stg_sellers s
+JOIN stg_order_items i ON s.seller_id = i.seller_id
+JOIN stg_orders o ON i.order_id = o.order_id
 LEFT JOIN geo g
-    ON printf('%05d', CAST(s.seller_zip_code_prefix AS INTEGER)) = g.cep;
+    ON printf('%05d', CAST(s.seller_zip_code_prefix AS INTEGER)) = g.cep
+WHERE o.order_purchase_timestamp BETWEEN (SELECT data_inicio FROM _etl_parametros)
+                                     AND (SELECT data_fim FROM _etl_parametros);
 
--- fato_itens_pedido
+-- fato_itens_pedido (insere itens dos pedidos do lote; UNIQUE(nk_order_id, order_item_id) impede duplicar)
 INSERT OR IGNORE INTO dw_fato_itens_pedido (
     sk_tempo_compra, sk_tempo_aprovacao, sk_cliente, sk_produto, sk_vendedor,
     nk_order_id, order_item_id, quantidade, valor_item, valor_frete, valor_total_item
@@ -215,9 +236,11 @@ LEFT JOIN dw_dim_cliente dc ON c.customer_unique_id = dc.nk_customer_unique_id
 LEFT JOIN dw_dim_produto dp ON i.product_id = dp.nk_product_id
 LEFT JOIN dw_dim_vendedor dv ON i.seller_id = dv.nk_seller_id
 LEFT JOIN dw_dim_tempo tc ON SUBSTR(o.order_purchase_timestamp, 1, 10) = tc.nk_data
-LEFT JOIN dw_dim_tempo ta ON SUBSTR(o.order_approved_at, 1, 10) = ta.nk_data;
+LEFT JOIN dw_dim_tempo ta ON SUBSTR(o.order_approved_at, 1, 10) = ta.nk_data
+WHERE o.order_purchase_timestamp BETWEEN (SELECT data_inicio FROM _etl_parametros)
+                                     AND (SELECT data_fim FROM _etl_parametros);
 
--- fato_pedidos
+-- fato_pedidos (consolida pagamentos, itens e avaliacoes sem duplicar review_id)
 WITH itens AS (
     SELECT order_id, COUNT(*) AS qtd
     FROM stg_order_items
@@ -241,9 +264,15 @@ pagamento_principal AS (
         ) AS rn
     FROM stg_order_payments
 ),
+-- remove review_id repetido antes de tirar a media do pedido
+avaliacoes_unicas AS (
+    SELECT DISTINCT review_id, order_id, review_score
+    FROM stg_order_reviews
+    WHERE review_id IS NOT NULL
+),
 avaliacoes AS (
     SELECT order_id, ROUND(AVG(review_score), 2) AS media_nota
-    FROM stg_order_reviews
+    FROM avaliacoes_unicas
     GROUP BY order_id
 )
 INSERT OR IGNORE INTO dw_fato_pedidos (
@@ -284,4 +313,6 @@ LEFT JOIN avaliacoes av ON o.order_id = av.order_id
 LEFT JOIN dw_dim_tempo tc ON SUBSTR(o.order_purchase_timestamp, 1, 10) = tc.nk_data
 LEFT JOIN dw_dim_tempo ta ON SUBSTR(o.order_approved_at, 1, 10) = ta.nk_data
 LEFT JOIN dw_dim_tempo te ON SUBSTR(o.order_delivered_customer_date, 1, 10) = te.nk_data
-LEFT JOIN dw_dim_tempo test ON SUBSTR(o.order_estimated_delivery_date, 1, 10) = test.nk_data;
+LEFT JOIN dw_dim_tempo test ON SUBSTR(o.order_estimated_delivery_date, 1, 10) = test.nk_data
+WHERE o.order_purchase_timestamp BETWEEN (SELECT data_inicio FROM _etl_parametros)
+                                     AND (SELECT data_fim FROM _etl_parametros);
